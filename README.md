@@ -1,71 +1,244 @@
-![](https://img.shields.io/badge/Foundry-v10-informational)
-<!--- Downloads @ Latest Badge -->
-<!--- replace <user>/<repo> with your username/repository -->
-<!--- ![Latest Release Download Count](https://img.shields.io/github/downloads/<user>/<repo>/latest/module.zip) -->
+这是一个经过润色、结构更加清晰且保留了所有技术细节的 `README.md` 版本。它采用了更符合开源项目文档的语气，将“用户视角”和“开发者视角”分开，使阅读更加流畅。
 
-<!--- Forge Bazaar Install % Badge -->
-<!--- replace <your-module-name> with the `name` in your manifest -->
-<!--- ![Forge Installs](https://img.shields.io/badge/dynamic/json?label=Forge%20Installs&query=package.installs&suffix=%25&url=https%3A%2F%2Fforge-vtt.com%2Fapi%2Fbazaar%2Fpackage%2F<your-module-name>&colorB=4aa94a) -->
+***
 
+# Babele Compendium On-Demand Patch  按需翻译补丁
 
-# How to use this Template to create a versioned Release
+这是一个针对 Foundry VTT + Babele 的性能优化补丁。它通过**“启动期轻量索引 + 读取期按需加载”**的策略，显著降低了进入世界时的等待时间以及网络和内存的峰值压力。
 
-1. Open your repository's releases page.
+本方案特别适用于像 **PF2e** 这样拥有海量 Compendium 条目的大型翻译合集包。
 
-![Where to click to open repository releases.](https://user-images.githubusercontent.com/7644614/93409301-9fd25080-f864-11ea-9e0c-bdd09e4418e4.png)
+## 📋 环境要求
 
-2. Click "Draft a new release"
+| 组件            | 要求版本      |
+| :-------------- | :------------ |
+| **Foundry VTT** | v13           |
+| **Babele**      | `2.7.5`       |
+| **依赖模块**    | `lib-wrapper` |
 
-![Draft a new release button.](https://user-images.githubusercontent.com/7644614/93409364-c1333c80-f864-11ea-89f1-abfcb18a8d9f.png)
+---
 
-3. Fill out the release version as the tag name.
+## 💡 核心原理与优势
 
-If you want to add details at this stage you can, or you can always come back later and edit them.
+### 🚫 传统模式的痛点
+原版 Babele 在世界启动（`ready` 阶段）时，会扫描翻译目录，并对每一个 Pack 的翻译文件执行全量加载（`fetch(...).json()`）。
+当翻译包包含成千上万个条目时（例如几万个法术或物品），这会导致：
+1. **世界启动极慢**：需要等待所有巨大的 JSON 文件下载并解析完毕。
+2. **内存占用高**：所有翻译数据一次性载入内存。
 
-![Release Creation Form](https://user-images.githubusercontent.com/7644614/93409543-225b1000-f865-11ea-9a19-f1906a724421.png)
+### ✅ 本方案：两阶段翻译策略
+本补丁将翻译加载过程拆分为两个阶段：
 
-4. Hit submit.
+1.  **启动期（快速索引）**
+    只加载极小的索引文件（`labels.json` 和 `titles.json`），仅用于处理：
+    *   侧边栏的包名（Compendium Label）。
+    *   索引条目的标题（用于搜索和列表显示）。
+    *   包内的文件夹名（Folders）。
 
-5. Wait a few minutes.
+2.  **使用期（按需加载）**
+    只有当你真正点击并打开某个具体的 Item/Actor 文档时，才会触发网络请求，加载该 Pack 对应的完整翻译文件并应用详细内容的翻译。
 
-A Github Action will run to populate the `module.json` and `module.zip` with the correct urls that you can then use to distribute this release. You can check on its status in the "Actions" tab.
+### 🚀 你将获得的效果
+*   **秒进世界**：不再需要在启动时下载/解析数兆字节的 `<collection>.json`。
+*   **体验无损**：Compendium 列表、搜索功能、侧边栏名称依然是完全翻译过的。
+*   **资源节约**：仅在需要时消耗内存和带宽。
 
-![Actions Tab](https://user-images.githubusercontent.com/7644614/93409820-c1800780-f865-11ea-8c6b-c3792e35e0c8.png)
+---
 
-6. Grab the module.json url from the release's details page.
+## 🔧 轻量索引生成器
 
-![image](https://user-images.githubusercontent.com/7644614/93409960-10c63800-f866-11ea-83f6-270cc5d10b71.png)
+为了实现“启动期轻量索引”，你需要从完整的翻译文件中提取数据并生成 `labels.json` 和 `titles.json`。本项目提供了自动化脚本 `generate-light-index.mjs`。
 
-This `module.json` will only ever point at this release's `module.zip`, making it useful for sharing a specific version for compatibility purposes.
+### 脚本功能
 
-7. You can use the url `https://github.com/<user>/<repo>/releases/latest/download/module.json` to refer to the manifest.
+扫描翻译目录，自动生成：
 
-This is the url you want to use to install the module typically, as it will get updated automatically.
+*   **labels.json**：包名映射。
+*   **titles.json**：包含 `titles` (条目标题) 和 `folders` (文件夹名) 的轻量映射。
 
-# How to List Your Releases on Package Admin
+### CLI 使用方法
 
-To request a package listing for your first release, go to the [Package Submission Form](https://foundryvtt.com/packages/submit) (accessible via a link at the bottom of the "[Systems and Modules](https://foundryvtt.com/packages/)" page on the Foundry website).
+```bash
+node tools/generate-light-index.mjs --input <翻译目录> --include-folders
+```
 
-Fill in the form. "Package Name" must match the name in the module manifest.  Package Title will be the display name for the package.  Package URL should be your repo URL.
-![image](https://user-images.githubusercontent.com/36359784/120664263-b49e5500-c482-11eb-9126-af7006389903.png)
+| 参数                | 简写 | 说明                                             |
+| :------------------ | :--- | :----------------------------------------------- |
+| `--input`           | `-i` | 指定包含 JSON 翻译文件的目录路径                 |
+| `--include-folders` |      | 在输出中包含文件夹（Folders）映射                |
+| `--compact`         |      | 输出压缩格式的 JSON（无空格换行）                |
+| `--no-recursive`    |      | 仅扫描当前目录，不递归子目录                     |
+| `--deep`            |      | 递归抽取深层嵌套的 `name` 字段（默认不建议开启） |
 
+## 🛠️ 安装与使用
 
-One of the Foundry staff will typically get back to you with an approval or any further questions within a few days, and give you access to the package admin pages.
+你可以根据需求选择以下两种方式之一来使用本补丁。
 
-Once you have access to the [module admin page](https://foundryvtt.com/admin/packages/package/), you can release a new version by going into the page for your module, scrolling to the bottom, and filling in a new Package Version.
+### 方式 A：作为独立模块安装（普通用户/GM）
 
-When listing a new version, Version should be the version number you set above, and the Manifest URL should be the manifest __for that specific version__ (do not use /latest/ here).
-![image](https://user-images.githubusercontent.com/36359784/120664346-c4b63480-c482-11eb-9d8b-731b50d70939.png)
+如果你只是想优化现有的翻译包，可以单独安装此补丁模块。
 
-> ### :warning: Important :warning:
-> 
-> It is very important that you use the specific release manifest url, and not the `/latest` url here. For more details about why this is important and how Foundry Installs/Updates packages, read [this wiki article](https://foundryvtt.wiki/en/development/guides/releases-and-history).
+1.  **下载/安装**
+    将 `foundry-babele-ondemand-patch/` 文件夹复制到你的 Foundry 数据目录：
+    `Data/modules/foundry-babele-ondemand-patch/`
+2.  **启用模块**
+    在世界设置中启用以下模块：
+    *   `Babele`
+    *   `libWrapper`
+    *   `Babele On-Demand Patch`
+3.  **配置**
+    在模块设置中找到 `Babele`（补丁会接管或复用此设置）：
+    *   将 **Loading Mode** 设置为 `ondemand`（按需加载），其实默认就是。
+    *   保存并刷新页面即可生效。
 
-Clicking "Save" in the bottom right will save the new version, which means that anyone installing your module from within Foundry will get that version, and a post will be generated in the #release-announcements channel on the official Foundry VTT Discord.
+### 方式 B：集成在翻译包中（翻译包作者）
 
+如果你是翻译包的维护者，建议直接将补丁集成到你的模块中，让用户开箱即用，无需额外安装补丁模块。
 
-# FoundryVTT Module
+1.  **复制脚本**
+    将 `foundry-babele-ondemand-patch.js` 放入你的模块目录，例如：
+    `your-translation-module/scripts/foundry-babele-ondemand-patch.js`
+2.  **更新 `module.json`**
+    在你的模块配置中声明依赖并引入脚本：
+    ```json
+    {
+      "relationships": {
+        "requires": [
+          { "id": "babele", "type": "module" },
+          { "id": "lib-wrapper", "type": "module" }
+        ]
+      },
+      "esmodules": [
+        "scripts/foundry-babele-ondemand-patch.js",
+        "scripts/main.js" 
+      ]
+    }
+    ```
+    *(或者，你也可以在你的 `main.js` 中使用 `import "./foundry-babele-ondemand-patch.js";`)*
 
-Does something, probably
+---
 
-## Changelog
+## 🤖 自动化：GitHub Actions
+
+推荐使用 GitHub Actions 在每次推送代码时自动生成索引，免去手动运行脚本的麻烦。
+
+### 1. 准备工作
+确保你的仓库中有以下文件结构：
+*   `tools/generate-light-index.mjs` (生成脚本)
+*   `.github/workflows/generate-light-index.yml` (工作流文件)
+
+### 2. 权限设置
+进入仓库 Settings -> Actions -> General -> Workflow permissions，选中 **Read and write permissions**，以便 Actions 可以提交生成的 JSON 文件回仓库。
+
+### 3. 工作流配置范例
+将以下内容保存为 `.github/workflows/generate-light-index.yml`。请根据实际情况修改 `INPUT_DIRS` 路径。
+
+```yaml
+name: Generate Babele light index
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: generate-light-index-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generate:
+    # 避免死循环，不响应机器人自己的提交
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Generate labels.json / titles.json
+        env:
+          SCRIPT_PATH: tools/generate-light-index.mjs
+          # 修改此处：支持多行，填入你的翻译文件所在目录
+          INPUT_DIRS: |
+            translations/zh-cn
+        run: |
+          set -euo pipefail
+          if [ ! -f "$SCRIPT_PATH" ]; then
+            echo "Error: Script not found at $SCRIPT_PATH"
+            exit 1
+          fi
+          
+          # 逐行读取目录并运行生成脚本
+          while IFS= read -r dir; do
+            [ -z "$dir" ] && continue
+            if [ ! -d "$dir" ]; then
+              echo "Warning: Input dir not found: $dir"
+              continue
+            fi
+            echo "Processing: $dir"
+            node "$SCRIPT_PATH" --input "$dir" --include-folders
+          done <<< "$INPUT_DIRS"
+
+      - name: Commit changes
+        run: |
+          set -euo pipefail
+          # 检查是否有文件变动
+          if git diff --quiet; then
+            echo "No changes detected."
+            exit 0
+          fi
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: regenerate light index [skip ci]"
+          git push
+```
+
+---
+
+## 📂 完整集成示例结构
+
+以下是一个集成了补丁和自动化的翻译包（以 `pf2e_compendium_chn` 为例）的推荐目录结构：
+
+```text
+pf2e_compendium_chn/
+├── module.json                      # 声明依赖 babele, lib-wrapper 和脚本
+├── scripts/
+│   ├── main.js
+│   └── foundry-babele-ondemand-patch.js  # 核心补丁脚本
+├── tools/
+│   └── generate-light-index.mjs     # 索引生成工具
+├── translations/
+│   └── zh-cn/                       # 翻译文件目录
+│       ├── labels.json              # [自动生成] 包名索引
+│       ├── titles.json              # [自动生成] 标题与文件夹索引
+│       ├── pf2e.feats-srd.json      # 完整翻译文件
+│       └── pf2e.monsters-srd.json   # 完整翻译文件
+└── .github/
+    └── workflows/
+        └── generate-light-index.yml # 自动化工作流
+```
+
+### 示例文件内容参考
+
+**translations/zh-cn/titles.json (生成结果示例):**
+```json
+{
+  "pf2e.monsters-srd": {
+    "titles": {
+      "Brimstone Rat": "硫磺鼠 Brimstone Rat"
+    },
+    "folders": {
+      "Animals": "动物"
+    }
+  }
+}
+```
