@@ -238,3 +238,22 @@ pf2e_compendium_chn/
   }
 }
 ```
+
+## Babele Version Compatibility
+
+This module supports both Babele 2.7.x legacy internals and Babele 2.8.x modern facade semantics.
+
+- Babele 2.7.x: uses legacy `TranslatedCompendium` when available.
+- Babele 2.8.x: prefers `game.babele` facade methods such as `translate()`, `isTranslated()`, `mappedCompendiumFor()`, and `translatedCompendiumFor()`.
+- In modern mode, converters and mappings should be registered before Babele initialization. If another module registers them after initialization, reload the world to rebuild Babele runtime state.
+
+## Manual Verification Matrix
+
+| Scenario | Expected Result |
+| --- | --- |
+| Babele 2.7.x + Full mode | Babele native full loading works. |
+| Babele 2.7.x + On-demand mode | Labels and titles load at startup; pack translation loads when documents open. |
+| Babele 2.8.x + Full mode | Babele native full loading works. |
+| Babele 2.8.x + On-demand mode | Startup does not fail if legacy internals are absent; facade translation is used after pack load. |
+| PF2e actor import | Actor root data, items, and effects are translated where matching translation data exists. |
+| Light index generation | `mapping.json` and `mappings.json` are skipped. |
