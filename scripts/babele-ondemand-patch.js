@@ -35,10 +35,17 @@ const NPC_TRANSLATOR_DEP_PACKS = [
 ];
 
 const ACTOR_IMPORT_DEBUG_DEFAULT = false;
+const PATCH_TRACE_DEFAULT = true;
+const PATCH_FETCH_TRACE_DEFAULT = true;
 const ACTOR_IMPORT_INTERNAL_OPTION = "__babeleOnDemandActorImportTranslate";
 
 let capturedBabele = null;
 let patched = false;
+
+const __patchDebugRoot = globalThis.BabeleOnDemandPatchDebug ?? (globalThis.BabeleOnDemandPatchDebug = {});
+if (typeof __patchDebugRoot.actorImport !== "boolean") __patchDebugRoot.actorImport = ACTOR_IMPORT_DEBUG_DEFAULT;
+if (typeof __patchDebugRoot.trace !== "boolean") __patchDebugRoot.trace = PATCH_TRACE_DEFAULT;
+if (typeof __patchDebugRoot.fetchTrace !== "boolean") __patchDebugRoot.fetchTrace = PATCH_FETCH_TRACE_DEFAULT;
 
 logPatch("module script loaded", { url: import.meta.url, patchId: PATCH_ID });
 
@@ -48,6 +55,125 @@ function logPatch(message, data = null) {
     else console.info(`[${PATCH_ID}] ${message}`);
   } catch {
   }
+}
+
+function tracePatch(message, data = null, { stack = false } = {}) {
+  if (!globalThis?.BabeleOnDemandPatchDebug?.trace) return;
+  try {
+    if (data !== null) console.info(`[${PATCH_ID}] [Trace] ${message}`, data);
+    else console.info(`[${PATCH_ID}] [Trace] ${message}`);
+    if (stack) {
+      console.trace(`[${PATCH_ID}] [TraceStack] ${message}`);
+    }
+  } catch {
+  }
+}
+
+function snapshotPatchState(babele, state = babele?.__ondemandPatch) {
+  return {
+    apiLevel: state?.apiLevel ?? null,
+    loadingMode: safeReadLoadingModeSettings(),
+    patched: !!state?.patched,
+    initialized: !!babele?.initialized,
+    globalMappingsLoaded: !!state?.globalMappingsLoaded,
+    labelsCount: Object.keys(state?.labels ?? {}).length,
+    titleIndexCollections: Object.keys(state?.titleIndex ?? {}).length,
+    translationFilesCached: Array.isArray(state?.translationFilesCache) ? state.translationFilesCache.length : 0,
+    mappingFilesCached: Array.isArray(state?.mappingFilesCache) ? state.mappingFilesCache.length : 0,
+    packTranslationUrlEntries: state?.packTranslationUrls?.size ?? 0,
+    packTranslationsLoading: state?.packTranslationsLoading?.size ?? 0,
+    loadedPacks: state?.loadedPacks?.size ?? 0,
+    lightMappedPacks: state?.lightMappedPacks?.size ?? 0,
+    compatPacks: state?.compatPacks?.size ?? 0,
+    lightRuntimeApplied: !!state?.lightRuntimeApplied,
+  };
+}
+
+function safeReadLoadingModeSettings() {
+  try {
+    return {
+      babele: game.settings?.get?.(BABEL_NAMESPACE, SETTING_LOADING_MODE) ?? null,
+      patch: game.settings?.get?.(PATCH_NAMESPACE, SETTING_LOADING_MODE) ?? null,
+    };
+  } catch {
+    return {
+      babele: null,
+      patch: null,
+    };
+  }
+}
+
+function classifyJsonUrl(url) {
+  const value = String(url ?? "");
+  if (!/\.json(?:$|[?#])/i.test(value)) return null;
+  if (/(^|\/)labels\.json(?:$|[?#])/i.test(value)) return "labels";
+  if (/(^|\/)titles\.json(?:$|[?#])/i.test(value)) return "titles";
+  if (/(^|\/)mappings?\.json(?:$|[?#])/i.test(value)) return "mapping";
+  if (/(modules|systems|worlds)\//i.test(value)) return "pack";
+  return "json";
+}
+
+function installFetchDiagnostics() {
+  const root = globalThis;
+  if (root.__BabeleOnDemandPatchFetchWrapped) return;
+  if (typeof root.fetch !== "function") return;
+
+  const originalFetch = root.fetch.bind(root);
+  root.__BabeleOnDemandPatchFetchWrapped = true;
+  root.__BabeleOnDemandPatchOriginalFetch = originalFetch;
+  root.__BabeleOnDemandPatchFetchSeen = root.__BabeleOnDemandPatchFetchSeen ?? new Set();
+  root.__BabeleOnDemandPatchFetchCounts = root.__BabeleOnDemandPatchFetchCounts ?? new Map();
+
+  root.fetch = async (...args) => {
+    const url = args?.[0]?.url ?? args?.[0];
+    const kind = classifyJsonUrl(url);
+    const shouldTrace = !!kind && !!root?.BabeleOnDemandPatchDebug?.fetchTrace;
+    const key = `${kind ?? "other"}::${String(url)}`;
+    const count = (root.__BabeleOnDemandPatchFetchCounts.get(key) ?? 0) + 1;
+    root.__BabeleOnDemandPatchFetchCounts.set(key, count);
+    const firstSeen = !root.__BabeleOnDemandPatchFetchSeen.has(key);
+    if (firstSeen) root.__BabeleOnDemandPatchFetchSeen.add(key);
+    if (shouldTrace) {
+      if (firstSeen || count === 10 || count === 100 || count % 500 === 0) {
+        tracePatch("fetch:start", {
+          kind,
+          url: String(url),
+          count,
+        }, { stack: firstSeen });
+      }
+    }
+
+    const started = Date.now();
+    try {
+      const response = await originalFetch(...args);
+      if (shouldTrace) {
+        if (firstSeen || count === 10 || count === 100 || count % 500 === 0) {
+          tracePatch("fetch:done", {
+            kind,
+            url: String(url),
+            count,
+            ok: response?.ok ?? null,
+            status: response?.status ?? null,
+            elapsedMs: Date.now() - started,
+          });
+        }
+      }
+      return response;
+    } catch (error) {
+      if (shouldTrace) {
+        tracePatch("fetch:error", {
+          kind,
+          url: String(url),
+          count,
+          elapsedMs: Date.now() - started,
+          error: error?.message ?? String(error),
+        });
+      }
+      throw error;
+    }
+  };
+
+  tracePatch("fetch diagnostics installed");
 }
 
 function detectBabeleApiLevel(babele) {
@@ -163,6 +289,7 @@ Hooks.once("init", () => {
 
 Hooks.once("ready", () => {
   logPatch("ready hook", { patched, hasBabele: !!game.babele });
+  installFetchDiagnostics();
   if (!patched && game.babele) {
     tryPatchBabele(game.babele);
   }
@@ -240,13 +367,16 @@ function getPatchLoadingModeSetting() {
 }
 
 function getLoadingModeSetting() {
+  const raw = safeReadLoadingModeSettings();
   try {
     const mode = game.settings?.get?.(BABEL_NAMESPACE, SETTING_LOADING_MODE);
     if (isValidLoadingMode(mode)) return mode;
   } catch {
   }
 
-  return getPatchLoadingModeSetting() ?? LOADING_MODES.ONDEMAND;
+  const fallback = getPatchLoadingModeSetting() ?? LOADING_MODES.ONDEMAND;
+  tracePatch("loading mode fallback used", { raw, resolved: fallback });
+  return fallback;
 }
 
 function syncPatchLoadingModeSetting(value) {
@@ -335,6 +465,8 @@ function isOnDemandMode() {
 }
 
 function tryPatchBabele(babele) {
+  installFetchDiagnostics();
+  tracePatch("tryPatchBabele entered", snapshotPatchState(babele));
   if (patched) {
     logPatch("tryPatchBabele skipped: already patched");
     return;
@@ -367,6 +499,30 @@ function tryPatchBabele(babele) {
   if (!state.original.translateActor && typeof babele.translateActor === "function") {
     state.original.translateActor = babele.translateActor.bind(babele);
   }
+  if (!state.original.translate && typeof babele.translate === "function") {
+    state.original.translate = babele.translate.bind(babele);
+  }
+  if (!state.original.translateField && typeof babele.translateField === "function") {
+    state.original.translateField = babele.translateField.bind(babele);
+  }
+  if (!state.original.extract && typeof babele.extract === "function") {
+    state.original.extract = babele.extract.bind(babele);
+  }
+  if (!state.original.extractField && typeof babele.extractField === "function") {
+    state.original.extractField = babele.extractField.bind(babele);
+  }
+  if (!state.original.isTranslated && typeof babele.isTranslated === "function") {
+    state.original.isTranslated = babele.isTranslated.bind(babele);
+  }
+  if (!state.original.translatedCompendiumFor && typeof babele.translatedCompendiumFor === "function") {
+    state.original.translatedCompendiumFor = babele.translatedCompendiumFor.bind(babele);
+  }
+  if (!state.original.mappedCompendiumFor && typeof babele.mappedCompendiumFor === "function") {
+    state.original.mappedCompendiumFor = babele.mappedCompendiumFor.bind(babele);
+  }
+  if (!state.original.applyRuntimeTranslations && typeof babele.applyRuntimeTranslations === "function") {
+    state.original.applyRuntimeTranslations = babele.applyRuntimeTranslations.bind(babele);
+  }
   if (!state.original.registerConverters && typeof babele.registerConverters === "function") {
     state.original.registerConverters = babele.registerConverters.bind(babele);
   }
@@ -397,8 +553,14 @@ function tryPatchBabele(babele) {
   state.actorNamePackLookup = state.actorNamePackLookup ?? null;
   state.actorNamePackLookupSource = state.actorNamePackLookupSource ?? null;
   state.compatPacks = state.compatPacks ?? new foundry.utils.Collection();
-  state.modernLoadedTranslations = state.modernLoadedTranslations ?? new Map();
-  state.modernInjectionWarnings = state.modernInjectionWarnings ?? new Set();
+  state.loadedPacks = state.loadedPacks ?? new Map();
+  state.lightMappedPacks = state.lightMappedPacks ?? new Map();
+  state.documentIndexRebuildTimer = state.documentIndexRebuildTimer ?? null;
+  state.lightRuntimeApplied = !!state.lightRuntimeApplied;
+  state.initOnDemandPromise = state.initOnDemandPromise ?? null;
+  state.readyRuntimeRefreshDone = !!state.readyRuntimeRefreshDone;
+
+  tracePatch("patch state initialized", snapshotPatchState(babele, state));
 
   babele.isFullMode = () => !isOnDemandMode();
   babele.translateIndexTitles = (index, pack) => translateIndexTitles(state, index, pack);
@@ -437,6 +599,7 @@ function tryPatchBabele(babele) {
   }
 
   babele.registerConverters = (converters = {}) => {
+    tracePatch("babele.registerConverters called", { names: Object.keys(converters ?? {}), mode: getLoadingModeSetting() });
     const result = state.original.registerConverters?.(converters);
     if (!isOnDemandMode()) return result;
     if (isModernBabele(state) && babele.initialized) {
@@ -452,6 +615,7 @@ function tryPatchBabele(babele) {
   };
 
   babele.registerMapping = (mapping) => {
+    tracePatch("babele.registerMapping called", { types: Object.keys(mapping ?? {}), mode: getLoadingModeSetting() });
     const result = state.original.registerMapping?.(mapping);
     if (!isOnDemandMode()) return result;
     if (isModernBabele(state) && babele.initialized) {
@@ -467,6 +631,39 @@ function tryPatchBabele(babele) {
   };
 
   babele.ensurePackTranslationsLoaded = async (collection) => ensurePackTranslationsLoaded(babele, state, collection);
+  babele.isTranslated = (pack) => {
+    if (!isOnDemandMode()) return state.original.isTranslated?.(pack) ?? false;
+    return !!getTranslatedPackCompat(babele, state, normalizePackId(pack));
+  };
+  babele.translatedCompendiumFor = (pack) => {
+    if (!isOnDemandMode()) return state.original.translatedCompendiumFor?.(pack) ?? null;
+    return getTranslatedPackCompat(babele, state, normalizePackId(pack));
+  };
+  babele.mappedCompendiumFor = (pack) => {
+    if (!isOnDemandMode()) return state.original.mappedCompendiumFor?.(pack) ?? null;
+    return getMappedPackCompat(babele, state, normalizePackId(pack));
+  };
+  babele.translate = (pack, data, translationsOnly = false) => {
+    if (!isOnDemandMode()) return state.original.translate?.(pack, data, translationsOnly) ?? data;
+    const translatedPack = getTranslatedPackCompat(babele, state, normalizePackId(pack));
+    return translatedPack?.translate?.(data, translationsOnly) ?? data;
+  };
+  babele.translateField = (field, pack, data) => {
+    if (!isOnDemandMode()) return state.original.translateField?.(field, pack, data) ?? null;
+    return getMappedPackCompat(babele, state, normalizePackId(pack))?.translateField?.(field, data) ?? null;
+  };
+  babele.extract = (pack, data, options = {}) => {
+    if (!isOnDemandMode()) return state.original.extract?.(pack, data, options);
+    return getMappedPackCompat(babele, state, normalizePackId(pack))?.extract?.(data, options);
+  };
+  babele.extractField = (pack, field, data) => {
+    if (!isOnDemandMode()) return state.original.extractField?.(pack, field, data);
+    return getMappedPackCompat(babele, state, normalizePackId(pack))?.extractField?.(field, data);
+  };
+  babele.applyRuntimeTranslations = async (options = {}) => {
+    if (!isOnDemandMode()) return state.original.applyRuntimeTranslations?.(options);
+    await applyLightRuntimeTranslations(babele, state, options);
+  };
 
   babele.translateActor = (actor) => {
     if (!actor) return state.original.translateActor?.(actor);
@@ -474,17 +671,52 @@ function tryPatchBabele(babele) {
     dialog.render(true);
   };
 
-  babele.init = async () => {
+  babele.init = async (callbackOrOptions = {}) => {
+    tracePatch("babele.init entered", {
+      mode: getLoadingModeSetting(),
+      initialized: !!babele.initialized,
+      hasCallback: typeof callbackOrOptions === "function",
+      optionKeys: callbackOrOptions && typeof callbackOrOptions === "object" ? Object.keys(callbackOrOptions) : [],
+    }, { stack: true });
     if (!isOnDemandMode()) {
-      return state.original.init?.();
+      tracePatch("babele.init delegating to original init");
+      return state.original.init?.(callbackOrOptions);
     }
-    if (babele.initialized) return true;
+    const afterInitialized =
+      typeof callbackOrOptions === "function"
+        ? callbackOrOptions
+        : typeof callbackOrOptions?.afterInitialized === "function"
+          ? callbackOrOptions.afterInitialized
+          : null;
+    if (babele.initialized) {
+      tracePatch("babele.init short-circuit: already initialized");
+      if (afterInitialized) await afterInitialized(babele);
+      return true;
+    }
 
-    await initOnDemand(babele, state);
+    if (state.initOnDemandPromise) {
+      tracePatch("babele.init joining in-flight initOnDemand");
+      await state.initOnDemandPromise;
+      if (afterInitialized) await afterInitialized(babele);
+      tracePatch("babele.init after joined callback", snapshotPatchState(babele, state));
+      return true;
+    }
+
+    tracePatch("babele.init starting initOnDemand");
+    state.initOnDemandPromise = initOnDemand(babele, state);
+    try {
+      await state.initOnDemandPromise;
+    } finally {
+      state.initOnDemandPromise = null;
+    }
+    tracePatch("babele.init after initOnDemand", snapshotPatchState(babele, state));
+    if (afterInitialized) await afterInitialized(babele);
+    tracePatch("babele.init after callback", snapshotPatchState(babele, state));
     return true;
   };
 
   babele.translateIndex = (index, pack) => {
+    tracePatch("babele.translateIndex called", { pack: normalizePackId(pack), count: Array.isArray(index) ? index.length : null });
     if (!isOnDemandMode()) {
       return state.original.translateIndex?.(index, pack) ?? index;
     }
@@ -492,13 +724,15 @@ function tryPatchBabele(babele) {
     const packId = normalizePackId(pack);
     if (!packId) return index;
 
-    if (isPackTranslationLoadedCompat(babele, state, packId) || babele.isTranslated?.(packId)) {
-      return state.original.translateIndex?.(index, packId) ?? index;
+    const translatedPack = getTranslatedPackCompat(babele, state, packId);
+    if (translatedPack?.translateIndex) {
+      return translatedPack.translateIndex(index) ?? index;
     }
     return babele.translateIndexTitles(index, packId);
   };
 
   babele.translatePackFolders = (pack) => {
+    tracePatch("babele.translatePackFolders called", { pack: normalizePackId(pack), folderCount: pack?.folders?.size ?? 0 });
     if (!isOnDemandMode()) {
       return state.original.translatePackFolders?.(pack);
     }
@@ -508,12 +742,21 @@ function tryPatchBabele(babele) {
     const folders = state.titleIndex?.[packId]?.folders ?? {};
     if (!folders || typeof folders !== "object") return;
     pack.folders.forEach((folder) => {
-      if (folders[folder.name]) folder.name = folders[folder.name];
+      const translated = folders[folder.originalName ?? folder.name];
+      if (translated) {
+        folder.originalName = folder.originalName ?? folder.name;
+        folder.name = translated;
+      }
     });
   };
 
   Hooks.on("babele.ready", async () => {
+    tracePatch("babele.ready hook entered", snapshotPatchState(babele, state));
     if (!isOnDemandMode()) return;
+    if (state.readyRuntimeRefreshDone) {
+      tracePatch("babele.ready hook skipped: runtime refresh already done");
+      return;
+    }
 
     try {
       await babele.shareLabels?.();
@@ -526,6 +769,17 @@ function tryPatchBabele(babele) {
       babele.applyLabels?.(labels);
     } catch {
     }
+
+    try {
+      if (!state.lightRuntimeApplied) {
+        await applyLightRuntimeTranslations(babele, state, { shareSources: false, notify: false });
+      } else {
+        tracePatch("babele.ready hook skipped runtime refresh: already applied during init");
+      }
+    } catch {
+    }
+    state.readyRuntimeRefreshDone = true;
+    tracePatch("babele.ready hook completed", snapshotPatchState(babele, state));
   });
 
   if (!state.actorImportHookRegistered && game.system?.id === "pf2e") {
@@ -575,6 +829,12 @@ function registerDebugConsoleApi() {
   if (typeof root.BabeleOnDemandPatchDebug.actorImport !== "boolean") {
     root.BabeleOnDemandPatchDebug.actorImport = ACTOR_IMPORT_DEBUG_DEFAULT;
   }
+  if (typeof root.BabeleOnDemandPatchDebug.trace !== "boolean") {
+    root.BabeleOnDemandPatchDebug.trace = PATCH_TRACE_DEFAULT;
+  }
+  if (typeof root.BabeleOnDemandPatchDebug.fetchTrace !== "boolean") {
+    root.BabeleOnDemandPatchDebug.fetchTrace = PATCH_FETCH_TRACE_DEFAULT;
+  }
 
   game.babeleOnDemandPatch = game.babeleOnDemandPatch ?? {};
   game.babeleOnDemandPatch.getActorImportDebug = () => !!root.BabeleOnDemandPatchDebug.actorImport;
@@ -582,6 +842,17 @@ function registerDebugConsoleApi() {
     root.BabeleOnDemandPatchDebug.actorImport = !!enabled;
     return root.BabeleOnDemandPatchDebug.actorImport;
   };
+  game.babeleOnDemandPatch.getTraceDebug = () => !!root.BabeleOnDemandPatchDebug.trace;
+  game.babeleOnDemandPatch.setTraceDebug = (enabled) => {
+    root.BabeleOnDemandPatchDebug.trace = !!enabled;
+    return root.BabeleOnDemandPatchDebug.trace;
+  };
+  game.babeleOnDemandPatch.getFetchTraceDebug = () => !!root.BabeleOnDemandPatchDebug.fetchTrace;
+  game.babeleOnDemandPatch.setFetchTraceDebug = (enabled) => {
+    root.BabeleOnDemandPatchDebug.fetchTrace = !!enabled;
+    return root.BabeleOnDemandPatchDebug.fetchTrace;
+  };
+  game.babeleOnDemandPatch.dumpState = () => snapshotPatchState(game.babele, game.babele?.__ondemandPatch);
 }
 
 function debugActorImport(message, data = null) {
@@ -835,6 +1106,11 @@ function tryTranslateActorFromPack(babele, packId, source) {
 }
 
 function autoTranslateImportedActorInPreCreate(actor, data, userId) {
+  debugActorImport("preCreate enter", {
+    actorName: actor?.name ?? data?.name ?? null,
+    userId,
+    mode: getLoadingModeSetting(),
+  });
   if (!isOnDemandMode()) return;
   if (!actor || actor.pack) return;
   if (typeof userId === "string" && userId !== game.userId) return;
@@ -876,6 +1152,11 @@ function autoTranslateImportedActorInPreCreate(actor, data, userId) {
 }
 
 function autoTranslateImportedActorInPreUpdate(actor, change, userId) {
+  debugActorImport("preUpdate enter", {
+    actorName: actor?.name ?? change?.name ?? null,
+    userId,
+    mode: getLoadingModeSetting(),
+  });
   if (!isOnDemandMode()) return;
   if (!actor || actor.pack) return;
   if (typeof userId === "string" && userId !== game.userId) return;
@@ -913,6 +1194,11 @@ function autoTranslateImportedActorInPreUpdate(actor, change, userId) {
 }
 
 async function autoTranslateImportedActorAfterCreate(actor, userId) {
+  debugActorImport("afterCreate enter", {
+    actorName: actor?.name ?? null,
+    userId,
+    mode: getLoadingModeSetting(),
+  });
   if (!isOnDemandMode()) return;
   if (!actor || actor.pack) return;
   if (typeof userId === "string" && userId !== game.userId) return;
@@ -969,6 +1255,11 @@ async function autoTranslateImportedActorAfterCreate(actor, userId) {
 }
 
 async function autoTranslateImportedActorAfterUpdate(actor, userId) {
+  debugActorImport("afterUpdate enter", {
+    actorName: actor?.name ?? null,
+    userId,
+    mode: getLoadingModeSetting(),
+  });
   if (!isOnDemandMode()) return;
   if (!actor || actor.pack) return;
   if (typeof userId === "string" && userId !== game.userId) return;
@@ -1155,33 +1446,207 @@ class PatchedOnDemandTranslateDialog extends Dialog {
 }
 
 async function initOnDemand(babele, state) {
+  tracePatch("initOnDemand start", snapshotPatchState(babele, state));
   if (!isModernBabele(state)) {
     babele.packs = new foundry.utils.Collection();
     babele.translations = [];
   }
   babele.folders = game.data?.folders;
 
+  tracePatch("initOnDemand loadGlobalMappingsOnce", snapshotPatchState(babele, state));
   await loadGlobalMappingsOnce(babele, state);
 
   const files = await getTranslationFiles(babele, state);
+  tracePatch("initOnDemand translation files discovered", { count: files?.length ?? 0, sample: (files ?? []).slice(0, 10) });
   state.packTranslationUrls = buildPackTranslationUrlIndex(babele, files);
+  tracePatch("initOnDemand packTranslationUrls indexed", { entries: state.packTranslationUrls.size });
 
   await ensureSpecialFolderTranslationsLoaded(babele, state, files);
 
   try {
     state.labels = await loadLabels(babele);
+    tracePatch("initOnDemand labels loaded", { count: Object.keys(state.labels ?? {}).length });
     babele.applyLabels?.(state.labels);
   } catch {
+    tracePatch("initOnDemand labels load failed");
   }
 
   try {
     state.titleIndex = await loadTitleIndex(babele);
+    tracePatch("initOnDemand titleIndex loaded", { collections: Object.keys(state.titleIndex ?? {}).length });
   } catch {
     state.titleIndex = {};
+    tracePatch("initOnDemand titleIndex load failed; reset to empty");
   }
 
+  tracePatch("initOnDemand applyLightRuntimeTranslations begin");
+  await applyLightRuntimeTranslations(babele, state, {
+    shareSources: false,
+    notify: false,
+    rebuildDocumentIndexNow: true,
+  });
+  tracePatch("initOnDemand applyLightRuntimeTranslations end", snapshotPatchState(babele, state));
+
   babele.initialized = true;
+  tracePatch("initOnDemand marked initialized", snapshotPatchState(babele, state));
   Hooks.callAll("babele.dataLoaded");
+  tracePatch("initOnDemand emitted babele.dataLoaded");
+}
+
+async function applyLightRuntimeTranslations(
+  babele,
+  state,
+  { shareSources = false, notify = false, rebuildDocumentIndexNow = false, rebuildPackTrees = false } = {},
+) {
+  if (!babele || !state) return;
+  tracePatch("applyLightRuntimeTranslations start", {
+    shareSources,
+    notify,
+    rebuildDocumentIndexNow,
+    rebuildPackTrees,
+    ...snapshotPatchState(babele, state),
+  });
+
+  if (shareSources && game.user?.isGM) {
+    try {
+      await game.settings.set(BABEL_NAMESPACE, SETTING_LABELS, state.labels ?? (await loadLabels(babele)));
+    } catch {
+    }
+    try {
+      await game.settings.set(BABEL_NAMESPACE, SETTING_TITLE_INDEX, state.titleIndex ?? (await loadTitleIndex(babele)));
+    } catch {
+    }
+    try {
+      const files = await getTranslationFiles(babele, state);
+      await game.settings.set(BABEL_NAMESPACE, "translationFiles", files);
+    } catch {
+    }
+    try {
+      const mappingFiles = await getMappingFiles(babele, state);
+      await game.settings.set(BABEL_NAMESPACE, "mappingFiles", mappingFiles);
+    } catch {
+    }
+  }
+
+  const labels = state.labels ?? {};
+  applyLabels(babele, labels);
+  tracePatch("applyLightRuntimeTranslations labels applied", { labelsCount: Object.keys(labels ?? {}).length });
+
+  let packCount = 0;
+  game.packs?.forEach?.((pack) => {
+    try {
+      packCount += 1;
+      tracePatch("applyLightRuntimeTranslations pack begin", {
+        packId: pack?.collection ?? pack?.metadata?.id ?? null,
+        label: pack?.metadata?.label ?? null,
+        indexCount: pack?.index?.size ?? pack?.index?.length ?? null,
+        folderCount: pack?.folders?.size ?? 0,
+      });
+      restorePackIndexCompat(pack);
+      restorePackFoldersCompat(pack);
+      translateIndexTitles(state, pack.index, pack.collection);
+      babele.translatePackFolders?.(pack);
+      if (rebuildPackTrees) {
+        tracePatch("applyLightRuntimeTranslations pack initializeTree", {
+          packId: pack?.collection ?? pack?.metadata?.id ?? null,
+        });
+        pack.initializeTree?.();
+      } else {
+        tracePatch("applyLightRuntimeTranslations pack initializeTree skipped", {
+          packId: pack?.collection ?? pack?.metadata?.id ?? null,
+        });
+      }
+      tracePatch("applyLightRuntimeTranslations pack end", {
+        packId: pack?.collection ?? pack?.metadata?.id ?? null,
+        label: pack?.metadata?.label ?? null,
+        indexCount: pack?.index?.size ?? pack?.index?.length ?? null,
+      });
+    } catch {
+      tracePatch("applyLightRuntimeTranslations pack failed", {
+        packId: pack?.collection ?? pack?.metadata?.id ?? null,
+      });
+    }
+  });
+  tracePatch("applyLightRuntimeTranslations packs processed", { packCount });
+
+  state.lightRuntimeApplied = true;
+  if (rebuildDocumentIndexNow) {
+    tracePatch("applyLightRuntimeTranslations rebuildDocumentIndex immediately");
+    await rebuildDocumentIndexCompat();
+  } else {
+    tracePatch("applyLightRuntimeTranslations schedule documentIndex rebuild");
+    scheduleDocumentIndexRebuild(state, "light-runtime");
+  }
+
+  if (notify) {
+    ui.notifications?.info?.("Babele on-demand light runtime refreshed.");
+  }
+  tracePatch("applyLightRuntimeTranslations end", snapshotPatchState(babele, state));
+}
+
+function restorePackIndexCompat(pack) {
+  pack?.index?.forEach?.((entry) => {
+    if (!entry) return;
+    if (entry.originalName) {
+      entry.name = entry.originalName;
+    }
+    if (entry.flags?.babele) {
+      delete entry.flags.babele;
+    }
+    delete entry.originalName;
+    delete entry.translated;
+    delete entry.hasTranslation;
+  });
+}
+
+function restorePackFoldersCompat(pack) {
+  pack?.folders?.forEach?.((folder) => {
+    if (!folder) return;
+    if (folder.originalName) {
+      folder.name = folder.originalName;
+      delete folder.originalName;
+    }
+  });
+}
+
+function scheduleDocumentIndexRebuild(state, reason = "manual") {
+  if (!state) return;
+  if (state.documentIndexRebuildTimer) return;
+  tracePatch("scheduleDocumentIndexRebuild queued", { reason });
+  state.documentIndexRebuildTimer = globalThis.setTimeout(async () => {
+    state.documentIndexRebuildTimer = null;
+    try {
+      tracePatch("scheduleDocumentIndexRebuild firing", { reason });
+      await rebuildDocumentIndexCompat();
+      logPatch("documentIndex rebuilt", { reason });
+    } catch {
+      tracePatch("scheduleDocumentIndexRebuild failed", { reason });
+    }
+  }, 50);
+}
+
+async function rebuildDocumentIndexCompat() {
+  const documentIndex = game.documentIndex;
+  if (!documentIndex || typeof documentIndex.index !== "function") {
+    tracePatch("rebuildDocumentIndexCompat skipped: no index API");
+    return;
+  }
+  tracePatch("rebuildDocumentIndexCompat start", {
+    treeCount: Object.keys(documentIndex?.trees ?? {}).length,
+    uuidCount: Object.keys(documentIndex?.uuids ?? {}).length,
+  });
+  await documentIndex.ready;
+  for (const key of Object.keys(documentIndex?.trees ?? {})) {
+    delete documentIndex.trees[key];
+  }
+  for (const key of Object.keys(documentIndex?.uuids ?? {})) {
+    delete documentIndex.uuids[key];
+  }
+  await documentIndex.index();
+  tracePatch("rebuildDocumentIndexCompat end", {
+    treeCount: Object.keys(documentIndex?.trees ?? {}).length,
+    uuidCount: Object.keys(documentIndex?.uuids ?? {}).length,
+  });
 }
 
 function normalizePackId(pack) {
@@ -1286,8 +1751,8 @@ function metadataSupportedByBabele(babele, metadata) {
 
 function getTranslatedPackCompat(babele, state, packId) {
   if (!babele || !packId) return null;
-  if (isModernBabele(state) && typeof babele.translatedCompendiumFor === "function") {
-    return babele.translatedCompendiumFor(packId) ?? state?.compatPacks?.get?.(packId) ?? null;
+  if (isModernBabele(state)) {
+    return state?.loadedPacks?.get?.(packId) ?? state?.compatPacks?.get?.(packId) ?? null;
   }
   return babele.packs?.get?.(packId) ?? state?.compatPacks?.get?.(packId) ?? null;
 }
@@ -1298,30 +1763,76 @@ function findLegacyTranslatedPackForData(babele, data) {
 
 function isPackTranslationLoadedCompat(babele, state, packId) {
   if (!babele || !packId) return false;
-  if (isModernBabele(state) && typeof babele.translatedCompendiumFor === "function") {
-    return !!babele.translatedCompendiumFor(packId) || !!state?.compatPacks?.get?.(packId)?.translated;
+  if (isModernBabele(state)) {
+    return !!state?.loadedPacks?.get?.(packId) || !!state?.compatPacks?.get?.(packId)?.translated;
   }
   return !!babele.packs?.get?.(packId)?.translated || !!state?.compatPacks?.get?.(packId)?.translated;
 }
 
 function translateDataCompat(babele, state, packId, data, translationsOnly = false) {
-  if (!babele || typeof babele.translate !== "function") return data;
-  let translated = babele.translate(packId, data, translationsOnly);
-  if (state?.compatPacks?.get?.(packId)?.translated && !isMeaningfulActorTranslation(data, translated)) {
-    translated = state.compatPacks.get(packId).translate(data, translationsOnly);
+  if (!babele) return data;
+  const translatedPack = getTranslatedPackCompat(babele, state, packId);
+  if (translatedPack?.translate) {
+    const translated = translatedPack.translate(data, translationsOnly);
+    if (translated !== undefined) {
+      return translated;
+    }
   }
-  if (
-    isModernBabele(state) &&
-    state?.modernLoadedTranslations?.has?.(packId) &&
-    !isMeaningfulActorTranslation(data, translated) &&
-    !state.modernInjectionWarnings.has(packId)
-  ) {
-    state.modernInjectionWarnings.add(packId);
-    console.warn(
-      `[${PATCH_ID}] Translation payload for ${packId} was loaded, but Babele modern facade did not expose an injection path. Verify Babele 2.8 adapter implementation.`,
-    );
+  if (!isModernBabele(state) && typeof babele.translate === "function") {
+    let translated = babele.translate(packId, data, translationsOnly);
+    if (state?.compatPacks?.get?.(packId)?.translated && !isMeaningfulActorTranslation(data, translated)) {
+      translated = state.compatPacks.get(packId).translate(data, translationsOnly);
+    }
+    return translated;
   }
-  return translated;
+  return data;
+}
+
+function getMappedPackCompat(babele, state, packId) {
+  if (!babele || !packId) return null;
+  const loaded = getTranslatedPackCompat(babele, state, packId);
+  if (loaded) return loaded;
+  if (!isModernBabele(state)) return babele.packs?.get?.(packId) ?? null;
+
+  if (!state.lightMappedPacks?.has?.(packId)) {
+    const metadata = getPackMetadata(babele, packId);
+    if (!metadata) return null;
+    state.lightMappedPacks.set(packId, createLightMappedPackCompat(babele, state, metadata, packId));
+  }
+  return state.lightMappedPacks.get(packId) ?? null;
+}
+
+function createLightMappedPackCompat(babele, state, metadata, packId) {
+  const translatedIndex = (index) => translateIndexTitles(state, index, packId);
+  return {
+    metadata,
+    translated: false,
+    hasTranslation(data) {
+      const titles = state.titleIndex?.[packId]?.titles ?? {};
+      const candidates = [
+        data?._id,
+        data?.originalName,
+        data?.name,
+        data?.flags?.core?.sourceId,
+      ].filter((value) => typeof value === "string" && value.length);
+      return candidates.some((value) => Object.prototype.hasOwnProperty.call(titles, value));
+    },
+    translateIndex(index) {
+      return translatedIndex(index);
+    },
+    translate(data) {
+      return data;
+    },
+    translateField() {
+      return null;
+    },
+    extract(data) {
+      return data;
+    },
+    extractField() {
+      return null;
+    },
+  };
 }
 
 function getTranslationDirectories(babele, state = babele?.__ondemandPatch) {
@@ -1348,50 +1859,72 @@ function getMappingDirectories(babele, state = babele?.__ondemandPatch) {
 }
 
 async function getTranslationFiles(babele, state) {
-  if (state.translationFilesCache) return state.translationFilesCache;
+  if (state.translationFilesCache) {
+    tracePatch("getTranslationFiles cache hit", { count: state.translationFilesCache.length });
+    return state.translationFilesCache;
+  }
 
   if (!game.user?.hasPermission?.("FILES_BROWSE")) {
-    return game.settings.get(BABEL_NAMESPACE, "translationFiles") ?? [];
+    const files = game.settings.get(BABEL_NAMESPACE, "translationFiles") ?? [];
+    tracePatch("getTranslationFiles using shared settings fallback", { count: files.length, sample: files.slice(0, 10) });
+    return files;
   }
 
   const dirs = getTranslationDirectories(babele, state);
+  tracePatch("getTranslationFiles browsing dirs", { dirs });
   const files = [];
   for (const dir of dirs) {
     try {
       const result = await foundry.applications.apps.FilePicker.browse("data", dir);
+      tracePatch("getTranslationFiles browse result", { dir, count: result.files?.length ?? 0 });
       for (const f of result.files ?? []) files.push(f);
     } catch {
+      tracePatch("getTranslationFiles browse failed", { dir });
     }
   }
   state.translationFilesCache = files;
+  tracePatch("getTranslationFiles completed", { count: files.length, sample: files.slice(0, 20) });
   return files;
 }
 
 async function getMappingFiles(babele, state) {
-  if (state.mappingFilesCache) return state.mappingFilesCache;
+  if (state.mappingFilesCache) {
+    tracePatch("getMappingFiles cache hit", { count: state.mappingFilesCache.length });
+    return state.mappingFilesCache;
+  }
 
   if (!game.user?.hasPermission?.("FILES_BROWSE")) {
-    return game.settings.get(BABEL_NAMESPACE, "mappingFiles") ?? [];
+    const files = game.settings.get(BABEL_NAMESPACE, "mappingFiles") ?? [];
+    tracePatch("getMappingFiles using shared settings fallback", { count: files.length, sample: files.slice(0, 10) });
+    return files;
   }
 
   const dirs = getMappingDirectories(babele, state);
+  tracePatch("getMappingFiles browsing dirs", { dirs });
   const files = [];
   for (const dir of dirs) {
     try {
       const result = await foundry.applications.apps.FilePicker.browse("data", dir);
+      tracePatch("getMappingFiles browse result", { dir, count: result.files?.length ?? 0 });
       for (const f of result.files ?? []) {
         if (typeof f === "string" && isMappingFileName(f)) files.push(f);
       }
     } catch {
+      tracePatch("getMappingFiles browse failed", { dir });
     }
   }
   state.mappingFilesCache = sortMappingFilesByDirectoryPreference(files);
+  tracePatch("getMappingFiles completed", { count: state.mappingFilesCache.length, files: state.mappingFilesCache.slice(0, 20) });
   return state.mappingFilesCache;
 }
 
 async function loadGlobalMappingsOnce(babele, state) {
-  if (state.globalMappingsLoaded) return;
+  if (state.globalMappingsLoaded) {
+    tracePatch("loadGlobalMappingsOnce skipped: already loaded");
+    return;
+  }
   const mappingFiles = await getMappingFiles(babele, state);
+  tracePatch("loadGlobalMappingsOnce mapping files", { count: mappingFiles?.length ?? 0, files: mappingFiles ?? [] });
   if (mappingFiles?.length) {
     const mappings = await Promise.all(
       mappingFiles.map(async (file) => {
@@ -1404,8 +1937,10 @@ async function loadGlobalMappingsOnce(babele, state) {
       }),
     );
     mappings.filter(Boolean).forEach((m) => babele.registerMapping?.(m));
+    tracePatch("loadGlobalMappingsOnce mappings registered", { count: mappings.filter(Boolean).length });
   }
   state.globalMappingsLoaded = true;
+  tracePatch("loadGlobalMappingsOnce completed");
 }
 
 function buildPackTranslationUrlIndex(babele, files) {
@@ -1453,51 +1988,6 @@ async function importModernMappedCompendium() {
   }
 }
 
-function ensureModernMappedCompendiumRegistry(babele) {
-  if (!babele) return null;
-  if (babele.mappedCompendiums?.get && babele.mappedCompendiums?.translated && babele.mappedCompendiums?.translate) {
-    if (!babele.mappedCompendiums.packs) {
-      babele.mappedCompendiums.packs = new foundry.utils.Collection();
-    }
-    return babele.mappedCompendiums;
-  }
-
-  const packs = babele.mappedCompendiums?.packs ?? new foundry.utils.Collection();
-  babele.mappedCompendiums = {
-    packs,
-    get(pack) {
-      return this.packs.get(pack) ?? null;
-    },
-    translated(pack) {
-      const compendium = this.get(pack);
-      return compendium?.translated ? compendium : null;
-    },
-    translateIndex(index, pack) {
-      return this.translated(pack)?.translateIndex(index) ?? index;
-    },
-    translate(pack, data, translationsOnly) {
-      return this.translated(pack)?.translate(data, translationsOnly) ?? data;
-    },
-    translateField(pack, field, data) {
-      return this.get(pack)?.translateField(field, data) ?? null;
-    },
-    extract(pack, data, options = {}) {
-      return this.get(pack)?.extract(data, options);
-    },
-    extractField(pack, field, data) {
-      return this.get(pack)?.extractField(field, data);
-    },
-    values() {
-      return this.packs.values();
-    },
-    matching(predicate) {
-      return [...this.values()].filter(predicate);
-    },
-  };
-
-  return babele.mappedCompendiums;
-}
-
 async function createModernMappedPackCompat(babele, metadata, translation) {
   if (!babele?.documentMappings || !metadataSupportedByBabele(babele, metadata)) return null;
 
@@ -1515,8 +2005,8 @@ function publishTranslatedPackCompat(babele, state, packId, translatedPack) {
   state.compatPacks.set(packId, translatedPack);
 
   if (isModernBabele(state)) {
-    const registry = ensureModernMappedCompendiumRegistry(babele);
-    registry?.packs?.set?.(packId, translatedPack);
+    state.loadedPacks.set(packId, translatedPack);
+    state.lightMappedPacks.delete(packId);
     return;
   }
 
@@ -1526,20 +2016,18 @@ function publishTranslatedPackCompat(babele, state, packId, translatedPack) {
 async function createTranslatedPackCompat(babele, state, metadata, translation) {
   if (!metadata || !translation) return null;
 
-  const LegacyTranslatedCompendium = await importLegacyTranslatedCompendium();
-  if (LegacyTranslatedCompendium) {
-    return new LegacyTranslatedCompendium(metadata, translation);
-  }
-
   if (isModernBabele(state)) {
     const mappedPack = await createModernMappedPackCompat(babele, metadata, translation);
     if (mappedPack) return mappedPack;
 
     const collection = getPackMetadataCollection(babele, metadata);
-    if (!state.modernInjectionWarnings.has(collection)) {
-      state.modernInjectionWarnings.add(collection);
-      console.warn(`[${PATCH_ID}] Unable to create a Babele 2.8 mapped compendium adapter for ${collection}.`);
-    }
+    console.warn(`[${PATCH_ID}] Unable to create a Babele 2.9 mapped compendium adapter for ${collection}.`);
+    return null;
+  }
+
+  const LegacyTranslatedCompendium = await importLegacyTranslatedCompendium();
+  if (LegacyTranslatedCompendium) {
+    return new LegacyTranslatedCompendium(metadata, translation);
   }
 
   return null;
@@ -1568,8 +2056,6 @@ async function ensureSpecialFolderTranslationsLoaded(babele, state, files) {
     const translatedPack = await createTranslatedPackCompat(babele, state, metadata, translation);
     if (translatedPack) {
       publishTranslatedPackCompat(babele, state, collection, translatedPack);
-    } else if (isModernBabele(state)) {
-      state.modernLoadedTranslations.set(collection, foundry.utils.mergeObject(translation, { collection }));
     }
   }
 }
@@ -1577,11 +2063,16 @@ async function ensureSpecialFolderTranslationsLoaded(babele, state, files) {
 async function loadLabels(babele) {
   const fromSettings = game.settings.get(BABEL_NAMESPACE, SETTING_LABELS) ?? {};
   const result = { ...(typeof fromSettings === "object" && !Array.isArray(fromSettings) ? fromSettings : {}) };
+  tracePatch("loadLabels start", { fromSettingsCount: Object.keys(result).length });
 
   const tryFetch = game.user?.hasPermission?.("FILES_BROWSE") || Object.keys(result).length === 0;
-  if (!tryFetch) return result;
+  if (!tryFetch) {
+    tracePatch("loadLabels skipped fetch; using settings cache", { count: Object.keys(result).length });
+    return result;
+  }
 
   const dirs = getTranslationDirectories(babele);
+  tracePatch("loadLabels fetch dirs", { dirs });
   for (const dir of dirs) {
     const base = dir.endsWith("/") ? dir.slice(0, -1) : dir;
     const url = `${base}/labels.json`;
@@ -1591,8 +2082,10 @@ async function loadLabels(babele) {
       const json = await r.json();
       if (json && typeof json === "object") Object.assign(result, json);
     } catch {
+      tracePatch("loadLabels fetch failed", { url });
     }
   }
+  tracePatch("loadLabels end", { count: Object.keys(result).length });
   return result;
 }
 
@@ -1602,11 +2095,16 @@ async function loadTitleIndex(babele) {
     typeof fromSettings === "object" && !Array.isArray(fromSettings)
       ? (foundry.utils?.deepClone ? foundry.utils.deepClone(fromSettings) : JSON.parse(JSON.stringify(fromSettings)))
       : {};
+  tracePatch("loadTitleIndex start", { fromSettingsCollections: Object.keys(index).length });
 
   const tryFetch = game.user?.hasPermission?.("FILES_BROWSE") || Object.keys(index).length === 0;
-  if (!tryFetch) return index;
+  if (!tryFetch) {
+    tracePatch("loadTitleIndex skipped fetch; using settings cache", { collections: Object.keys(index).length });
+    return index;
+  }
 
   const dirs = getTranslationDirectories(babele);
+  tracePatch("loadTitleIndex fetch dirs", { dirs });
   for (const dir of dirs) {
     const base = dir.endsWith("/") ? dir.slice(0, -1) : dir;
     const url = `${base}/titles.json`;
@@ -1622,8 +2120,10 @@ async function loadTitleIndex(babele) {
         if (data.folders && typeof data.folders === "object") Object.assign(index[collection].folders, data.folders);
       }
     } catch {
+      tracePatch("loadTitleIndex fetch failed", { url });
     }
   }
+  tracePatch("loadTitleIndex end", { collections: Object.keys(index).length });
   return index;
 }
 
@@ -1633,14 +2133,20 @@ function applyLabels(babele, labels) {
   try {
     for (const metadata of game.data?.packs ?? []) {
       const collection = collectionFromMetadata(babele, metadata);
-      if (labels[collection]) metadata.label = labels[collection];
+      if (labels[collection]) {
+        metadata.originalLabel = metadata.originalLabel ?? metadata.label;
+        metadata.label = labels[collection];
+      }
     }
   } catch {
   }
 
   try {
     game.packs?.forEach?.((pack) => {
-      if (labels[pack.collection]) pack.metadata.label = labels[pack.collection];
+      if (labels[pack.collection]) {
+        pack.metadata.originalLabel = pack.metadata.originalLabel ?? pack.metadata.label;
+        pack.metadata.label = labels[pack.collection];
+      }
     });
   } catch {
   }
@@ -1731,11 +2237,12 @@ async function ensureNpcDependenciesLoaded(babele, state, currentPackId) {
 async function ensurePackTranslationsLoaded(babele, state, collection) {
   const packId = normalizePackId(collection);
   if (!packId) return;
-
-  if (isModernBabele(state) && state.original.ensurePackTranslationsLoaded) {
-    await state.original.ensurePackTranslationsLoaded(packId);
-    if (isPackTranslationLoadedCompat(babele, state, packId) || babele.isTranslated?.(packId)) return;
-  }
+  tracePatch("ensurePackTranslationsLoaded enter", {
+    packId,
+    alreadyLoaded: isPackTranslationLoadedCompat(babele, state, packId),
+    pending: state.packTranslationsLoading.get(packId) != null,
+    indexedUrlCount: state.packTranslationUrls?.get?.(packId)?.length ?? 0,
+  }, { stack: true });
 
   if (isPackTranslationLoadedCompat(babele, state, packId)) return;
 
@@ -1749,6 +2256,7 @@ async function ensurePackTranslationsLoaded(babele, state, collection) {
     if (!state.packTranslationUrls?.size) {
       const files = await getTranslationFiles(babele, state);
       state.packTranslationUrls = buildPackTranslationUrlIndex(babele, files);
+      tracePatch("ensurePackTranslationsLoaded rebuilt URL index", { entries: state.packTranslationUrls.size });
     }
 
     let urls = state.packTranslationUrls.get(packId);
@@ -1758,6 +2266,12 @@ async function ensurePackTranslationsLoaded(babele, state, collection) {
       indexedUrlCount: urls?.length ?? 0,
     });
     let translation = urls?.length ? await loadTranslationFromUrls(urls) : null;
+    tracePatch("ensurePackTranslationsLoaded indexed URL load result", {
+      packId,
+      urlCount: urls?.length ?? 0,
+      loaded: !!translation,
+      hasReference: !!translation?.reference,
+    });
 
     if (!translation) {
       const directUrls = buildDirectPackTranslationUrls(babele, packId, state);
@@ -1771,15 +2285,30 @@ async function ensurePackTranslationsLoaded(babele, state, collection) {
           urls,
         });
       }
+      tracePatch("ensurePackTranslationsLoaded direct URL load result", {
+        packId,
+        urlCount: directUrls.length,
+        loaded: !!directTranslation,
+      });
     }
 
     if (!translation) {
       debugActorImport("pack翻译加载失败（未找到可用json）", { packId });
+      tracePatch("ensurePackTranslationsLoaded abort: no translation found", { packId });
       return;
     }
 
     const metadata = getPackMetadata(babele, packId);
-    if (!metadata) return;
+    if (!metadata) {
+      tracePatch("ensurePackTranslationsLoaded abort: no metadata", { packId });
+      return;
+    }
+    tracePatch("ensurePackTranslationsLoaded metadata resolved", {
+      packId,
+      type: metadata.type,
+      packageName: metadata.packageName ?? null,
+      name: metadata.name ?? null,
+    });
 
     if (!state.npcDepsLoaded && !state.npcDepsLoading) {
       const needsNpcDeps = mappingUsesConverters(translation.mapping, NPC_TRANSLATOR_CONVERTERS);
@@ -1794,8 +2323,16 @@ async function ensurePackTranslationsLoaded(babele, state, collection) {
     const translatedPack = await createTranslatedPackCompat(babele, state, metadata, translation);
     if (translatedPack) {
       publishTranslatedPackCompat(babele, state, packId, translatedPack);
+      tracePatch("ensurePackTranslationsLoaded translated pack published", {
+        packId,
+        translated: !!translatedPack?.translated,
+        referenceCount: Array.isArray(translation.reference)
+          ? translation.reference.length
+          : translation.reference ? 1 : 0,
+      });
     } else if (isModernBabele(state)) {
-      state.modernLoadedTranslations.set(packId, storedTranslation);
+      state.lightMappedPacks.set(packId, createLightMappedPackCompat(babele, state, metadata, packId));
+      tracePatch("ensurePackTranslationsLoaded fallback to lightMappedPack", { packId });
     }
 
     if (!isModernBabele(state) && Array.isArray(babele.translations)) {
@@ -1825,10 +2362,16 @@ async function ensurePackTranslationsLoaded(babele, state, collection) {
 
     if (translation.reference) {
       const refs = Array.isArray(translation.reference) ? translation.reference : [translation.reference];
+      tracePatch("ensurePackTranslationsLoaded loading references", { packId, refs });
       for (const ref of refs) {
         await ensurePackTranslationsLoaded(babele, state, ref);
       }
     }
+    tracePatch("ensurePackTranslationsLoaded exit success", {
+      packId,
+      loadedPacks: state.loadedPacks?.size ?? 0,
+      lightMappedPacks: state.lightMappedPacks?.size ?? 0,
+    });
   })();
 
   state.packTranslationsLoading.set(packId, loader);
@@ -1840,18 +2383,36 @@ async function ensurePackTranslationsLoaded(babele, state, collection) {
 }
 
 async function loadTranslationFromUrls(urls) {
+  tracePatch("loadTranslationFromUrls start", { urls });
   const translations = await Promise.all(
     (urls ?? []).map(async (url) => {
       try {
         const r = await fetch(url);
-        return await r.json();
+        const json = await r.json();
+        tracePatch("loadTranslationFromUrls fetched JSON", {
+          url,
+          ok: r?.ok ?? null,
+          status: r?.status ?? null,
+          hasEntries: !!json?.entries,
+          hasMapping: !!json?.mapping,
+          hasReference: !!json?.reference,
+        });
+        return json;
       } catch {
+        tracePatch("loadTranslationFromUrls fetch failed", { url });
         return null;
       }
     }),
   );
 
-  return mergeTranslationPayloads(translations);
+  const merged = mergeTranslationPayloads(translations);
+  tracePatch("loadTranslationFromUrls end", {
+    urlCount: urls?.length ?? 0,
+    loadedCount: translations.filter(Boolean).length,
+    merged: !!merged,
+    hasReference: !!merged?.reference,
+  });
+  return merged;
 }
 
 function getMergedMapping(babele, metadata, translation) {
@@ -1972,15 +2533,27 @@ function registerWrappers() {
     PATCH_ID,
     "CONFIG.DatabaseBackend._getDocuments",
     async function (wrapped, ...args) {
+      tracePatch("_getDocuments enter", {
+        mode: getLoadingModeSetting(),
+        requestPack: normalizePackId(args?.[1]?.pack ?? null),
+        requestIndex: !!(args?.[1]?.index ?? args?.[1]?.options?.index),
+        documentClass: typeof args?.[0] === "function" ? args[0].name ?? "anonymous" : typeof args?.[0],
+      });
       const result = await wrapped(...args);
+      tracePatch("_getDocuments after wrapped", {
+        resultType: Array.isArray(result) ? "array" : typeof result,
+        resultCount: Array.isArray(result) ? result.length : null,
+      });
       if (!isOnDemandMode()) return result;
 
       const babele = game.babele;
       if (!babele) return result;
       if (!babele.initialized) {
         try {
+          tracePatch("_getDocuments forcing babele.init");
           await babele.init();
         } catch {
+          tracePatch("_getDocuments init failed");
           return result;
         }
       }
@@ -1992,18 +2565,28 @@ function registerWrappers() {
       const isIndex = request.index ?? request.options?.index;
       const state = babele.__ondemandPatch;
       if (!state) return result;
+      tracePatch("_getDocuments state", snapshotPatchState(babele, state));
 
       if (isIndex) {
         try {
+          tracePatch("_getDocuments translating index");
           translateIndexTitles(state, result, packId);
         } catch {
+          tracePatch("_getDocuments index translation failed", { packId });
         }
         return result;
       }
 
       try {
+        tracePatch("_getDocuments ensurePackTranslationsLoaded begin", { packId });
         await babele.ensurePackTranslationsLoaded?.(packId);
+        tracePatch("_getDocuments ensurePackTranslationsLoaded end", {
+          packId,
+          translated: !!getTranslatedPackCompat(babele, state, packId),
+          loaded: isPackTranslationLoadedCompat(babele, state, packId),
+        });
       } catch {
+        tracePatch("_getDocuments ensurePackTranslationsLoaded failed", { packId });
         return result;
       }
 
@@ -2013,11 +2596,13 @@ function registerWrappers() {
       if (!documentClass || !Array.isArray(result)) return result;
 
       try {
+        tracePatch("_getDocuments translating documents", { packId, count: result.length });
         return result.map((doc) => {
           const source = typeof doc?.toObject === "function" ? doc.toObject() : doc;
           return reconstructDocumentCompat(documentClass, translateDataCompat(babele, state, packId, source), packId);
         });
       } catch {
+        tracePatch("_getDocuments translation failed", { packId });
         return result;
       }
     },
@@ -2028,6 +2613,11 @@ function registerWrappers() {
     PATCH_ID,
     "CompendiumCollection.prototype.initializeTree",
     function (wrapped, ...args) {
+      tracePatch("initializeTree enter", {
+        packId: normalizePackId(this),
+        indexCount: this?.index?.size ?? this?.index?.length ?? null,
+        folderCount: this?.folders?.size ?? 0,
+      });
       const out = wrapped(...args);
       if (!isOnDemandMode()) return out;
 
@@ -2037,15 +2627,64 @@ function registerWrappers() {
         const packId = normalizePackId(this);
         if (!babele || !state || !packId) return out;
 
+        tracePatch("initializeTree applying title index", { packId });
         translateIndexTitles(state, this.index, packId);
 
         const folders = state.titleIndex?.[packId]?.folders ?? {};
         if (folders && this.folders?.size) {
           this.folders.forEach((folder) => {
-            if (folders[folder.name]) folder.name = folders[folder.name];
+            const translated = folders[folder.originalName ?? folder.name];
+            if (translated) {
+              folder.originalName = folder.originalName ?? folder.name;
+              folder.name = translated;
+            }
           });
         }
       } catch {
+        tracePatch("initializeTree failed", { packId: normalizePackId(this) });
+      }
+
+      return out;
+    },
+    "WRAPPER",
+  );
+
+  libWrapper.register(
+    PATCH_ID,
+    "foundry.documents.collections.CompendiumCollection.prototype.indexDocument",
+    function (wrapped, ...args) {
+      tracePatch("indexDocument enter", {
+        packId: normalizePackId(this),
+        documentId: args?.[0]?.id ?? args?.[0]?._id ?? null,
+      });
+      const out = wrapped(...args);
+      if (!isOnDemandMode()) return out;
+
+      try {
+        const document = args?.[0];
+        const id = document?.id ?? document?._id;
+        const packId = normalizePackId(this);
+        const babele = game.babele;
+        const state = babele?.__ondemandPatch;
+        if (!id || !packId || !state) return out;
+
+        const entry = this.index?.get?.(id);
+        if (!entry) return out;
+
+        if (entry.originalName == null) {
+          entry.originalName = document?.originalName ?? document?.name ?? entry.name;
+        }
+
+        translateIndexTitles(state, [entry], packId);
+        scheduleDocumentIndexRebuild(state, "indexDocument");
+        tracePatch("indexDocument applied", {
+          packId,
+          documentId: id,
+          entryName: entry?.name ?? null,
+          originalName: entry?.originalName ?? null,
+        });
+      } catch {
+        tracePatch("indexDocument failed", { packId: normalizePackId(this) });
       }
 
       return out;

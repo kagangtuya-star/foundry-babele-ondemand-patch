@@ -9,7 +9,7 @@
 | 组件            | 要求版本      |
 | :-------------- | :------------ |
 | **Foundry VTT** | v13           |
-| **Babele**      | `2.7.5`       |
+| **Babele**      | `2.7.x / 2.9.x` |
 | **依赖模块**    | `lib-wrapper` |
 
 ---
@@ -241,10 +241,10 @@ pf2e_compendium_chn/
 
 ## Babele Version Compatibility
 
-This module supports both Babele 2.7.x legacy internals and Babele 2.8.x modern facade semantics.
+This module supports both Babele 2.7.x legacy internals and Babele 2.9.x modern facade semantics.
 
 - Babele 2.7.x: uses legacy `TranslatedCompendium` when available.
-- Babele 2.8.x: prefers `game.babele` facade methods such as `translate()`, `isTranslated()`, `mappedCompendiumFor()`, and `translatedCompendiumFor()`.
+- Babele 2.9.x: prefers `game.babele` facade methods such as `translate()`, `isTranslated()`, `mappedCompendiumFor()`, and `translatedCompendiumFor()`.
 - In modern mode, converters and mappings should be registered before Babele initialization. If another module registers them after initialization, reload the world to rebuild Babele runtime state.
 
 ## Manual Verification Matrix
@@ -253,7 +253,7 @@ This module supports both Babele 2.7.x legacy internals and Babele 2.8.x modern 
 | --- | --- |
 | Babele 2.7.x + Full mode | Babele native full loading works. |
 | Babele 2.7.x + On-demand mode | Labels and titles load at startup; pack translation loads when documents open. |
-| Babele 2.8.x + Full mode | Babele native full loading works. |
-| Babele 2.8.x + On-demand mode | Startup does not fail if legacy internals are absent; facade translation is used after pack load. |
+| Babele 2.9.x + Full mode | Babele native full loading works. |
+| Babele 2.9.x + On-demand mode | Startup uses light indexes; facade translation is used after pack load. |
 | PF2e actor import | Actor root data, items, and effects are translated where matching translation data exists. |
 | Light index generation | `mapping.json` and `mappings.json` are skipped. |
