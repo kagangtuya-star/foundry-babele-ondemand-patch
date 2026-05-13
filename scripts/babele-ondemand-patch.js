@@ -526,6 +526,24 @@ function isOnDemandMode() {
   return getLoadingModeSetting() === LOADING_MODES.ONDEMAND;
 }
 
+const CHINESE_LANGUAGE_ALIASES = new Set([
+  "cn",
+  "zh-CN",
+  "zh_Hans",
+  "zh-Hans",
+  "zh-cn",
+  "zh_hans",
+]);
+
+function languageMatches(registered, current) {
+  if (!registered) return true;
+  if (registered === current) return true;
+  return (
+    CHINESE_LANGUAGE_ALIASES.has(registered) &&
+    CHINESE_LANGUAGE_ALIASES.has(current)
+  );
+}
+
 function tryPatchBabele(babele) {
   installFetchDiagnostics();
   tracePatch("tryPatchBabele entered", snapshotPatchState(babele));
@@ -2154,7 +2172,7 @@ function getTranslationDirectories(babele, state = babele?.__ondemandPatch) {
     ? [`systems/${game.system.id}/${babele.systemTranslationsDir}/${lang}`]
     : [];
   const modules = getRegisteredTranslationModules(babele, state)
-    .filter((m) => !m.lang || m.lang === lang)
+    .filter((m) => languageMatches(m.lang, lang))
     .flatMap((m) => m.dirs.map((dir) => `modules/${m.module}/${dir}`));
   const configured =
     directory && directory.trim && directory.trim()
